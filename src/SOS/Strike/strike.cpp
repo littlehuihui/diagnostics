@@ -127,6 +127,7 @@
 #include <set>
 #include <algorithm>
 #include <vector>
+#include <map>
 
 #include "tls.h"
 
@@ -4107,6 +4108,63 @@ private:
 *    (May not work if GC is in progress.)                              *
 *                                                                      *
 \**********************************************************************/
+
+bool TryGetContinuation(CLRDATA_ADDRESS addr, CLRDATA_ADDRESS mt, CLRDATA_ADDRESS* contAddr, CLRDATA_ADDRESS* contMT)
+{
+	// Get the continuation field from the task.
+	int offset = GetObjFieldOffset(addr, mt, W("m_continuationObject"));
+	if (offset != 0)
+	{
+		DWORD_PTR contObjPtr;
+		MOVE(contObjPtr, addr + offset);
+		if (sos::IsObject(contObjPtr, false))
+		{
+			// Ideally this continuation is itself an async method box.
+			sos::Object contObj = contObjPtr;
+			if (GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("StateMachine")) == 0)
+			{
+				// It was something else.
+				
+				// If it's storing an action wrapper, try to follow to that action's target.
+				if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("m_action"))) != 0)
+				{
+					MOVE(contObjPtr, contObj.GetAddress() + offset);
+					if (sos::IsObject(contObjPtr, false))
+					{
+						contObj = contObjPtr;
+					}
+				}
+
+				// If it's storing an action, try to follow through to its target.
+				if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("_target"))) != 0)
+				{
+					MOVE(contObjPtr, contObj.GetAddress() + offset);
+					if (sos::IsObject(contObjPtr, false))
+					{
+						contObj = contObjPtr;
+					}
+				}
+			}
+
+			// Use whatever object we ended with.
+			*contAddr = contObj.GetAddress();
+			*contMT = contObj.GetMT();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+struct StateMachineRecord
+{
+	CLRDATA_ADDRESS Address;
+	CLRDATA_ADDRESS MT;
+	BOOL IsValueType;
+	BOOL IsTopLevel;
+	std::vector<CLRDATA_ADDRESS>* Continuations;
+};
+
 DECLARE_API(DumpAsync)
 {
     INIT_API();
@@ -4166,9 +4224,10 @@ DECLARE_API(DumpAsync)
         // Print out header for the main line of each async state machine object.
         ExtOut("%" POINTERSIZE "s %" POINTERSIZE "s %8s %s\n", "Address", "MT", "Size", "Name");
 
+		std::map<CLRDATA_ADDRESS, StateMachineRecord*> stateMachineRecords;
+
         // Walk each heap object looking for async state machine objects.
         BOOL missingStateFieldWarning = FALSE;
-        int numStateMachines = 0;
         for (sos::ObjectIterator itr = gcheap.WalkHeap(); !IsInterrupt() && itr != NULL; ++itr)
         {
             // Skip objects we know to be too small to possibly be a state machine.
@@ -4258,65 +4317,153 @@ DECLARE_API(DumpAsync)
                 }
             }
 
-            // We now have a state machine that's passed all of our criteria.  Print out its details.
+            // We now have a state machine that's passed all of our criteria.
+			StateMachineRecord* smr = new StateMachineRecord();
+			smr->Address = itr->GetAddress();
+			smr->MT = itr->GetMT();
+			smr->IsValueType = bStateMachineIsValueType;
+			smr->Continuations = new std::vector<CLRDATA_ADDRESS>();
+			smr->IsTopLevel = true;
+			stateMachineRecords.insert(std::pair<CLRDATA_ADDRESS,StateMachineRecord*>(smr->Address, smr));
 
-            // Print out top level description of the state machine object.
-            ExtOut("#%d\n", numStateMachines);
-            numStateMachines++;
-            DMLOut("%s %s %8d", DMLObject(itr->GetAddress()), DMLDumpHeapMT(itr->GetMT()), itr->GetSize());
-            ExtOut("  %S\n", itr->GetTypeName());
+            //// Print out top level description of the state machine object.
+            //ExtOut("#%d\n", numStateMachines);
+            //numStateMachines++;
+            //DMLOut("%s %s %8d", DMLObject(itr->GetAddress()), DMLDumpHeapMT(itr->GetMT()), itr->GetSize());
+            //ExtOut("  %S\n", itr->GetTypeName());
 
-            // Output the state machine's name and fields.
-            DacpMethodTableData mtabledata;
-            DacpMethodTableFieldData vMethodTableFields;
-            if (mtabledata.Request(g_sos, stateMachineMT) == S_OK &&
-                vMethodTableFields.Request(g_sos, stateMachineMT) == S_OK &&
-                vMethodTableFields.wNumInstanceFields + vMethodTableFields.wNumStaticFields > 0)
-            {
-                sos::MethodTable mt = (TADDR)stateMachineMT;
-                ExtOut("StateMachine: %S (%s)\n", mt.GetName(), bStateMachineIsValueType ? "struct" : "class");
-                DisplayFields(stateMachineMT, &mtabledata, &vMethodTableFields, (DWORD_PTR)stateMachineAddr, TRUE, bStateMachineIsValueType);
-            }
+            //// Output the state machine's name and fields.
+            //DacpMethodTableData mtabledata;
+            //DacpMethodTableFieldData vMethodTableFields;
+            //if (mtabledata.Request(g_sos, stateMachineMT) == S_OK &&
+            //    vMethodTableFields.Request(g_sos, stateMachineMT) == S_OK &&
+            //    vMethodTableFields.wNumInstanceFields + vMethodTableFields.wNumStaticFields > 0)
+            //{
+            //    sos::MethodTable mt = (TADDR)stateMachineMT;
+            //    ExtOut("StateMachine: %S (%s)\n", mt.GetName(), bStateMachineIsValueType ? "struct" : "class");
+            //    DisplayFields(stateMachineMT, &mtabledata, &vMethodTableFields, (DWORD_PTR)stateMachineAddr, TRUE, bStateMachineIsValueType);
+            //}
 
-            // If the object already has a registered continuation, output it.
-            int iContOffset = GetObjFieldOffset(TO_CDADDR(itr->GetAddress()), itr->GetMT(), W("m_continuationObject"));
-            if (iContOffset > 0)
-            {
-                DWORD_PTR ContObjPtr;
-                MOVE(ContObjPtr, itr->GetAddress() + iContOffset);
-                DMLOut("Continuation: %s", DMLObject(ContObjPtr));
-                if (sos::IsObject(ContObjPtr, false))
-                {
-                    sos::Object contObj = ContObjPtr;
-                    ExtOut(" (%S)", contObj.GetTypeName());
-                }
-                ExtOut("\n");
-            }
+			//bool wroteContinuationsHeader = false;
+			//std::vector<std::tuple<int, CLRDATA_ADDRESS, CLRDATA_ADDRESS>> continuationChainToExplore;
+			//continuationChainToExplore.push_back(std::make_tuple(1, TO_CDADDR(itr->GetAddress()), itr->GetMT()));
+			//while (continuationChainToExplore.size() > 0)
+			{
+				//std::tuple<int, CLRDATA_ADDRESS, CLRDATA_ADDRESS> cur = continuationChainToExplore.back();
+				//continuationChainToExplore.pop_back();
+				//int curIndent = std::get<0>(cur);
+				//CLRDATA_ADDRESS curAddr = std::get<1>(cur);
+				//CLRDATA_ADDRESS curMT = std::get<2>(cur);
 
-            // Finally, output gcroots, as they can serve as call stacks, and also help to highlight
-            // state machines that aren't being kept alive.
-            if (roots)
-            {
-                ExtOut("GC roots:\n");
-                IncrementIndent();
-                GCRootImpl gcroot;
-                int numRoots = gcroot.PrintRootsForObject(*itr, FALSE, FALSE);
-                DecrementIndent();
+				CLRDATA_ADDRESS nextAddr, nextMT;
+				if (TryGetContinuation(itr->GetAddress(), itr->GetMT(), &nextAddr, &nextMT))
+				{
+					sos::Object contObj = nextAddr;
+					if (_wcsncmp(contObj.GetTypeName(), W("System.Collections.Generic.List`1"), 33) == 0)
+					{
+						int itemsOffset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("_items"));
+						if (itemsOffset != 0)
+						{
+							DWORD_PTR listItemsPtr;
+							MOVE(listItemsPtr, contObj.GetAddress() + itemsOffset);
+							if (sos::IsObject(listItemsPtr, false))
+							{
+								// We got a continuation; if it's a List<object>, don't output it itself and instead push all of its contents.
+								DacpObjectData objData;
+								if (objData.Request(g_sos, TO_CDADDR(listItemsPtr)) == S_OK && objData.ObjectType == OBJ_ARRAY)
+								{
+									for (int i = 0; i < objData.dwNumComponents; i++)
+									{
+										CLRDATA_ADDRESS elementPtr;
+										MOVE (elementPtr, TO_CDADDR(objData.ArrayDataPtr + (i * objData.dwComponentSize)));
+										if (elementPtr != NULL && sos::IsObject(elementPtr, false))
+										{
+											//sos::Object elementObj = elementPtr;
 
-                if (stateValue >= 0 && numRoots == 0)
-                {
-                    ExtOut("Incomplete state machine (<>1__state == %d) with 0 roots.\n", stateValue);
-                }
-            }
+											//if (!wroteContinuationsHeader)
+											//{
+											//	ExtOut("Continuations:\n");
+											//	wroteContinuationsHeader = true;
+											//}
+											//for (int i = 0; i < curIndent; i++) ExtOut(".");
+											//DMLOut("%s", DMLObject(elementObj.GetAddress()));
+											//ExtOut(" (%S)\n", elementObj.GetTypeName());
 
-            ExtOut("\n");
+											//continuationChainToExplore.push_back(std::make_tuple(curIndent + 1, elementObj.GetAddress(), elementObj.GetMT()));
+											smr->Continuations->push_back(elementPtr);
+										}
+									}
+									continue;
+								}
+							}
+						}
+					}
+					
+					//if (!wroteContinuationsHeader)
+					//{
+					//	ExtOut("Continuations:\n");
+					//	wroteContinuationsHeader = true;
+					//}
+					//for (int i = 0; i < curIndent; i++) ExtOut(".");
+					//DMLOut("%s", DMLObject(contObj.GetAddress()));
+					//ExtOut(" (%S)\n", contObj.GetTypeName());
+					
+					//continuationChainToExplore.push_back(std::make_tuple(curIndent + 1, contObj.GetAddress(), contObj.GetMT()));
+					smr->Continuations->push_back(contObj.GetAddress());
+				}
+			}
+
+            //// Finally, output gcroots, as they can serve as call stacks, and also help to highlight
+            //// state machines that aren't being kept alive.
+            //if (roots)
+            //{
+            //    ExtOut("GC roots:\n");
+            //    IncrementIndent();
+            //    GCRootImpl gcroot;
+            //    int numRoots = gcroot.PrintRootsForObject(*itr, FALSE, FALSE);
+            //    DecrementIndent();
+
+            //    if (stateValue >= 0 && numRoots == 0)
+            //    {
+            //        ExtOut("Incomplete state machine (<>1__state == %d) with 0 roots.\n", stateValue);
+            //    }
+            //}
+
+            //ExtOut("\n");
         }
 
-        ExtOut("\nFound %d state machines.\n", numStateMachines);
+        ExtOut("\nFound %d state machines.\n", stateMachineRecords.size());
         if (missingStateFieldWarning)
         {
             ExtOut("Warning: Could not find a state machine's <>1__state field.\n");
         }
+
+		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+		{
+			for (std::vector<CLRDATA_ADDRESS>::iterator contIt = smrIt->second->Continuations.begin(); contIt != smrIt->second->Continuations.end(); ++contIt)
+			{
+				std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator found = stateMachineRecords.find(*contIt);
+				if (found != stateMachineRecords.end())
+				{
+					found->second->IsTopLevel = false;
+				}
+			}
+		}
+
+		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+		{
+			if (!smrIt->second->IsTopLevel)
+			{
+				continue;
+			}
+		}
+
+		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+		{
+			delete it->second->Continuations;
+			delete it->second;
+		}
+
         return S_OK;
     }
     catch (const sos::Exception &e)
