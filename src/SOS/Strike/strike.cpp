@@ -128,6 +128,7 @@
 #include <algorithm>
 #include <vector>
 #include <map>
+#include <fstream>
 
 #include "tls.h"
 
@@ -4183,14 +4184,15 @@ DECLARE_API(DumpAsync)
         // Process command-line arguments.
         size_t nArg = 0;
         TADDR mt = NULL;
-        ArrayHolder<char> ansiType = NULL;
+		ArrayHolder<char> ansiType = NULL;
+		ArrayHolder<char> dgmlPath = NULL;
         ArrayHolder<WCHAR> type = NULL;
-		BOOL dml = FALSE, waiting = FALSE, roots = FALSE, chains = FALSE;
+		BOOL dml = FALSE, waiting = FALSE, roots = FALSE;
         CMDOption option[] =
         {   // name, vptr, type, hasValue
             { "-mt", &mt, COHEX, TRUE },             // dump state machines only with a given MethodTable
-            { "-type", &ansiType, COSTRING, TRUE },  // dump state machines only that contain the specified type substring
-			{ "-chains", &chains, COBOOL, FALSE },   // dump state machines only when they're at the start of a continuation chain
+			{ "-type", &ansiType, COSTRING, TRUE },  // dump state machines only that contain the specified type substring
+			{ "-dgml", &dgmlPath, COSTRING, TRUE },  // output state machine graph to specified dgml file
             { "-waiting", &waiting, COBOOL, FALSE }, // dump state machines only when they're in a waiting state
             { "-roots", &roots, COBOOL, FALSE },     // gather GC root information
 #ifndef FEATURE_PAL
@@ -4199,7 +4201,7 @@ DECLARE_API(DumpAsync)
         };
         if (!GetCMDOption(args, option, _countof(option), NULL, 0, &nArg))
         {
-            sos::Throw<sos::Exception>("Usage: DumpAsync [-mt MethodTableAddr] [-type TypeName] [-chains] [-waiting] [-roots]");
+            sos::Throw<sos::Exception>("Usage: DumpAsync [-mt MethodTableAddr] [-type TypeName] [-waiting] [-roots] [-dgml]");
         }
         if (nArg != 0)
         {
@@ -4354,12 +4356,74 @@ DECLARE_API(DumpAsync)
 		}
 
 		size_t uniqueChains = stateMachineRecords.size();
-		if (chains)
+		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
 		{
+			for (std::vector<CLRDATA_ADDRESS>::iterator contIt = smrIt->second->Continuations->begin(); contIt != smrIt->second->Continuations->end(); ++contIt)
+			{
+				std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator found = stateMachineRecords.find(*contIt);
+				if (found != stateMachineRecords.end())
+				{
+					if (found->second->IsTopLevel)
+					{
+						found->second->IsTopLevel = false;
+						uniqueChains--;
+					}
+				}
+			}
+		}
+
+		if (dgmlPath != NULL)
+		{
+			std::map<CLRDATA_ADDRESS, int> mtCounts;
+			for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+			{
+				CLRDATA_ADDRESS addr = smrIt->second->StateMachineMT != 0 ? smrIt->second->StateMachineMT : smrIt->second->MT;
+				std::map<CLRDATA_ADDRESS, int>::iterator found = mtCounts.find(addr);
+				if (found == mtCounts.end())
+				{
+					mtCounts.insert(std::pair<CLRDATA_ADDRESS, int>(addr, 1));
+				}
+				else
+				{
+					found->second++;
+				}
+			}
+
+			std::wofstream fs;
+			fs.open(dgmlPath, std::fstream::out);
+			fs << L"<?xml version=\"1.0\" encoding=\"utf-8\"?>";
+			fs << L"<DirectedGraph Title=\"Async Graph\" xmlns=\"http://schemas.microsoft.com/vs/2009/dgml\">";
+			fs << L"  <Nodes>";
+
+			for (std::map<CLRDATA_ADDRESS, int>::iterator mtIt = mtCounts.begin(); mtIt != mtCounts.end(); ++mtIt)
+			{
+				sos::MethodTable curMT = mtIt->first;
+				fs << L"    <Node Id=\"" << mtIt->first << L"\" Label=\"";
+				for (const WCHAR* c = curMT.GetName(); *c != 0; c++)
+				{
+					switch (*c)
+					{
+						case '&':  fs << "&amp;";       break;
+						case '\"': fs << "&quot;";      break;
+						case '\'': fs << "&apos;";      break;
+						case '<':  fs << "&lt;";        break;
+						case '>':  fs << "&gt;";        break;
+						default:   fs << *c; break;
+					}
+				}
+				fs << L" (" << mtIt->second << L")\" />";
+			}
+
+			fs << L"  </Nodes>";
+			fs << L"  <Links>";
+
 			for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
 			{
 				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = smrIt->second->Continuations->begin(); contIt != smrIt->second->Continuations->end(); ++contIt)
 				{
+					sos::Object contObj = *contIt;
+					fs << L"    <Link Source=\"" << smrIt->second->MT << L"\" Target=\"" << contObj.GetMT() << L"\" Label=\"\" />";
+
 					std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator found = stateMachineRecords.find(*contIt);
 					if (found != stateMachineRecords.end())
 					{
@@ -4371,6 +4435,11 @@ DECLARE_API(DumpAsync)
 					}
 				}
 			}
+
+			fs << L"  </Links>";
+			fs << L"</DirectedGraph>";
+
+			fs.close();
 		}
 
 		ExtOut("\nFound %d state machines in %d chains.\n", stateMachineRecords.size(), uniqueChains);
