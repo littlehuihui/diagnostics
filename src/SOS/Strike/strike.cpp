@@ -4181,11 +4181,49 @@ struct AsyncRecord
 	CLRDATA_ADDRESS MT;
 	CLRDATA_ADDRESS StateMachineAddr;
 	CLRDATA_ADDRESS StateMachineMT;
+	BOOL IsStateMachine;
 	BOOL IsValueType;
 	BOOL IsTopLevel;
 	int StateValue;
-	std::vector<CLRDATA_ADDRESS>* Continuations;
+	std::vector<CLRDATA_ADDRESS> Continuations;
 };
+
+bool TaskIsCompleted(sos::Object obj)
+{
+	DacpFieldDescData stateField;
+	int offset = GetObjFieldOffset(obj.GetAddress(), obj.GetMT(), W("m_stateFlags"), TRUE, &stateField);
+	if (offset != 0)
+	{
+		int stateValue;
+		MOVE(stateValue, obj.GetAddress() + offset);
+
+		const int TASK_STATE_COMPLETED_MASK = 0x1600000;
+		return (stateValue & TASK_STATE_COMPLETED_MASK) != 0;
+	}
+
+	return false;
+}
+
+BOOL derivedFrom(CLRDATA_ADDRESS mtObj, __in_z LPWSTR baseString)
+{
+	// We want to follow back until we get the mt
+	DacpMethodTableData dmtd;
+	CLRDATA_ADDRESS walkMT = mtObj;
+	while (walkMT != NULL)
+	{
+		if (dmtd.Request(g_sos, walkMT) != S_OK)
+		{
+			break;
+		}
+		NameForMT_s(TO_TADDR(walkMT), g_mdName, mdNameLen);
+		if (_wcscmp(baseString, g_mdName) == 0)
+		{
+			return TRUE;
+		}
+		walkMT = dmtd.ParentMethodTable;
+	}
+	return FALSE;
+}
 
 DECLARE_API(DumpAsync)
 {
@@ -4205,11 +4243,12 @@ DECLARE_API(DumpAsync)
 		ArrayHolder<char> ansiType = NULL;
 		ArrayHolder<char> dgmlPath = NULL;
         ArrayHolder<WCHAR> type = NULL;
-		BOOL dml = FALSE, waiting = FALSE, roots = FALSE;
+		BOOL dml = FALSE, waiting = FALSE, roots = FALSE, allTasks = FALSE;
         CMDOption option[] =
         {   // name, vptr, type, hasValue
             { "-mt", &mt, COHEX, TRUE },             // dump state machines only with a given MethodTable
 			{ "-type", &ansiType, COSTRING, TRUE },  // dump state machines only that contain the specified type substring
+			{ "-tasks", &allTasks, COBOOL, FALSE },  // include all tasks that can be found on the heap
 			{ "-dgml", &dgmlPath, COSTRING, TRUE },  // output state machine graph to specified dgml file
             { "-waiting", &waiting, COBOOL, FALSE }, // dump state machines only when they're in a waiting state
 			{ "-roots", &roots, COBOOL, FALSE },     // gather GC root information
@@ -4219,7 +4258,7 @@ DECLARE_API(DumpAsync)
         };
         if (!GetCMDOption(args, option, _countof(option), NULL, 0, &nArg))
         {
-            sos::Throw<sos::Exception>("Usage: DumpAsync [-mt MethodTableAddr] [-type TypeName] [-waiting] [-roots] [-dgml]");
+            sos::Throw<sos::Exception>("Usage: DumpAsync [-mt MethodTableAddr] [-type TypeName] [-tasks] [-waiting] [-roots] [-dgml]");
         }
         if (nArg != 0)
         {
@@ -4247,94 +4286,75 @@ DECLARE_API(DumpAsync)
 
         // Walk each heap object looking for async state machine objects.
 		std::map<CLRDATA_ADDRESS, AsyncRecord> asyncRecords;
-		BOOL missingStateFieldWarning = FALSE;
 		for (sos::ObjectIterator itr = gcheap.WalkHeap(); !IsInterrupt() && itr != NULL; ++itr)
 		{
-			if (itr->GetSize() <= 24 || // Skip objects too small to be state machines, avoiding some compiler-generated caching data structures.
+			if (itr->GetSize() <= 24 || // Skip objects too small to be state machines or tasks, avoiding some compiler-generated caching data structures.
 				(mt != NULL && mt != itr->GetMT()) || // Match only MTs the user requested.
 				(type != NULL && _wcsstr(itr->GetTypeName(), type) == NULL)) // Match only type name substrings the user requested.
 			{
 				continue;
 			}
 
-			// Match only the two known state machine class name prefixes.
-			if (_wcsncmp(itr->GetTypeName(), W("System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+AsyncStateMachineBox`1"), 79) != 0 &&               // Normal box.
-				_wcsncmp(itr->GetTypeName(), W("System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+DebugFinalizableAsyncStateMachineBox`1"), 95) != 0) // Used when certain ETW events enabled.
+			// Match only the two known state machine class name prefixes, unless all tasks have been asked for.
+			if (allTasks)
+			{
+				if (!derivedFrom(itr->GetMT(), W("System.Threading.Tasks.Task")))
+				{
+					continue;
+				}
+			}
+			else if (_wcsncmp(itr->GetTypeName(), W("System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+AsyncStateMachineBox`1"), 79) != 0 &&               // Normal box.
+				     _wcsncmp(itr->GetTypeName(), W("System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1+DebugFinalizableAsyncStateMachineBox`1"), 95) != 0) // Used when certain ETW events enabled.
 			{
 				continue;
 			}
+
+			// If we only want tasks if they're not completed, skip this one if it's a task and it's completed.
+			if (waiting && TaskIsCompleted(*itr))
+			{
+				continue;
+			}
+
+			AsyncRecord ar;
+			ar.Address = itr->GetAddress();
+			ar.MT = itr->GetMT();
+			ar.StateMachineAddr = itr->GetAddress();
+			ar.StateMachineMT = itr->GetMT();
+			ar.IsValueType = false;
+			ar.IsTopLevel = true;
+			ar.IsStateMachine = false;
 
 			// Get the async state machine object's StateMachine field.  If we can't, it's not
 			// an async state machine we can handle.
 			DacpFieldDescData stateMachineField;
 			int stateMachineFieldOffset = GetObjFieldOffset(TO_CDADDR(itr->GetAddress()), itr->GetMT(), W("StateMachine"), TRUE, &stateMachineField);
-			if (stateMachineFieldOffset <= 0)
+			if (stateMachineFieldOffset != 0)
 			{
-				continue;
-			}
+				ar.IsStateMachine = true;
 
-			// Get the address and method table of the state machine.  While it'll generally be a struct,
-			// it is valid for it to be a class, so we accommodate both.
-			BOOL bStateMachineIsValueType = stateMachineField.Type == ELEMENT_TYPE_VALUETYPE;
-			CLRDATA_ADDRESS stateMachineAddr;
-			CLRDATA_ADDRESS stateMachineMT;
-			if (bStateMachineIsValueType)
-			{
-				stateMachineAddr = itr->GetAddress() + stateMachineFieldOffset;
-				stateMachineMT = stateMachineField.MTOfType;
-			}
-			else
-			{
-				MOVE(stateMachineAddr, itr->GetAddress() + stateMachineFieldOffset);
-				DacpObjectData objData;
-				if (objData.Request(g_sos, stateMachineAddr) != S_OK)
+				// Get the address and method table of the state machine.  While it'll generally be a struct,
+				// it is valid for it to be a class, so we accommodate both.  It could also be a non-state machine Task.
+				ar.IsValueType = stateMachineField.Type == ELEMENT_TYPE_VALUETYPE;
+				if (ar.IsValueType)
 				{
-					// Couldn't get the class-based object; just skip this state machine.
-					continue;
+					ar.StateMachineAddr = itr->GetAddress() + stateMachineFieldOffset;
+					ar.StateMachineMT = stateMachineField.MTOfType;
 				}
-				stateMachineMT = objData.MethodTable; // update from Canon to actual type
-			}
-
-			// Get the current state value of the state machine. If the user has requested to filter down
-			// to only those state machines that are currently at an await, compare it against the expected
-			// waiting values.  This value can also be used in later analysis.
-			int stateValue = -2;
-			DacpFieldDescData stateField;
-			int stateFieldOffset = bStateMachineIsValueType ?
-				GetValueFieldOffset(stateMachineMT, W("<>1__state"), &stateField) :
-				GetObjFieldOffset(stateMachineAddr, stateMachineMT, W("<>1__state"), TRUE, &stateField);
-			if (stateFieldOffset < 0 || (!bStateMachineIsValueType && stateFieldOffset == 0))
-			{
-				missingStateFieldWarning = TRUE;
-				if (waiting)
+				else
 				{
-					// waiting was specified and we couldn't find the field to satisfy the query,
-					// so skip this object.
-					continue;
-				}
-			}
-			else
-			{
-				MOVE(stateValue, stateMachineAddr + stateFieldOffset);
-				if (waiting && stateValue < 0)
-				{
-					// 0+ values correspond to the await in linear sequence in the method, so a non-negative
-					// value indicates the state machine is at an await.  Since we're filtering for waiting,
-					// anything else should be skipped.
-					continue;
+					MOVE(ar.StateMachineAddr, itr->GetAddress() + stateMachineFieldOffset);
+					DacpObjectData objData;
+					if (objData.Request(g_sos, ar.StateMachineAddr) != S_OK)
+					{
+						// Couldn't get the class-based object; just skip this state machine.
+						continue;
+					}
+					ar.StateMachineMT = objData.MethodTable; // update from Canon to actual type
 				}
 			}
 
-			// We now have a state machine that's passed all of our criteria.
-			AsyncRecord ar;
-			ar.Address = itr->GetAddress();
-			ar.MT = itr->GetMT();
-			ar.StateMachineAddr = stateMachineAddr;
-			ar.StateMachineMT = stateMachineMT;
-			ar.IsValueType = bStateMachineIsValueType;
-			ar.Continuations = new std::vector<CLRDATA_ADDRESS>();
-			ar.IsTopLevel = true;
-			ar.StateValue = stateValue;
+			// We now have an object that's passed all of our criteria.
+			//ar.Continuations = new std::vector<CLRDATA_ADDRESS>();
 
 			CLRDATA_ADDRESS nextAddr;
 			if (TryGetContinuation(itr->GetAddress(), itr->GetMT(), &nextAddr))
@@ -4362,7 +4382,7 @@ DECLARE_API(DumpAsync)
 									if (elementPtr != NULL && sos::IsObject(elementPtr, false))
 									{
 										ResolveContinuation(&elementPtr);
-										ar.Continuations->push_back(elementPtr);
+										ar.Continuations.push_back(elementPtr);
 									}
 								}
 							}
@@ -4372,7 +4392,7 @@ DECLARE_API(DumpAsync)
 
 				if (!addedList)
 				{
-					ar.Continuations->push_back(contObj.GetAddress());
+					ar.Continuations.push_back(contObj.GetAddress());
 				}
 			}
 
@@ -4382,7 +4402,7 @@ DECLARE_API(DumpAsync)
 		size_t uniqueChains = asyncRecords.size();
 		for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 		{
-			for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations->begin(); contIt != arIt->second.Continuations->end(); ++contIt)
+			for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations.begin(); contIt != arIt->second.Continuations.end(); ++contIt)
 			{
 				std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator found = asyncRecords.find(*contIt);
 				if (found != asyncRecords.end())
@@ -4411,7 +4431,7 @@ DECLARE_API(DumpAsync)
 					found->second++;
 				}
 
-				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations->begin(); contIt != arIt->second.Continuations->end(); ++contIt)
+				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations.begin(); contIt != arIt->second.Continuations.end(); ++contIt)
 				{
 					if (asyncRecords.find(*contIt) == asyncRecords.end())
 					{
@@ -4459,7 +4479,7 @@ DECLARE_API(DumpAsync)
 
 			for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 			{
-				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations->begin(); contIt != arIt->second.Continuations->end(); ++contIt)
+				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations.begin(); contIt != arIt->second.Continuations.end(); ++contIt)
 				{
 					sos::Object contObj = *contIt;
 					fs << L"    <Link Source=\"" << arIt->second.MT << L"\" Target=\"" << contObj.GetMT() << L"\" Label=\"\" />";
@@ -4482,14 +4502,8 @@ DECLARE_API(DumpAsync)
 			fs.close();
 		}
 
-		ExtOut("\nFound %d state machines in %d chains.\n", asyncRecords.size(), uniqueChains);
-		if (missingStateFieldWarning)
-		{
-			ExtOut("Warning: Could not find a state machine's <>1__state field.\n");
-		}
-		ExtOut("\n");
-
-		// Print out header for the main line of each async state machine object.
+		// Print out header for the main line of each result.
+		ExtOut("\nFound %d async objects in %d chains.\n\n", asyncRecords.size(), uniqueChains);
 		ExtOut("%" POINTERSIZE "s %" POINTERSIZE "s %8s %s\n", "Address", "MT", "Size", "Name");
 
 		int counter = 0;
@@ -4503,7 +4517,8 @@ DECLARE_API(DumpAsync)
 			ExtOut("#%d", counter++);
 			DacpMethodTableData mtabledata;
 			DacpMethodTableFieldData vMethodTableFields;
-			if (mtabledata.Request(g_sos, arIt->second.StateMachineMT) == S_OK &&
+			if (arIt->second.IsStateMachine &&
+				mtabledata.Request(g_sos, arIt->second.StateMachineMT) == S_OK &&
 				vMethodTableFields.Request(g_sos, arIt->second.StateMachineMT) == S_OK &&
 				vMethodTableFields.wNumInstanceFields + vMethodTableFields.wNumStaticFields > 0)
 			{
@@ -4520,7 +4535,7 @@ DECLARE_API(DumpAsync)
 				ExtOut("  %S\n", obj.GetTypeName());
 			}
 
-			if (arIt->second.Continuations->size() > 0)
+			if (arIt->second.Continuations.size() > 0)
 			{
 				ExtOut("Continuations:\n");
 				std::vector<std::pair<int, CLRDATA_ADDRESS>> continuationChainToExplore;
@@ -4529,17 +4544,27 @@ DECLARE_API(DumpAsync)
 				{
 					std::pair<int, CLRDATA_ADDRESS> cur = continuationChainToExplore.back();
 					continuationChainToExplore.pop_back();
-					std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator curStateMachine = asyncRecords.find(cur.second);
-					if (curStateMachine != asyncRecords.end())
+					std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator curAsyncRecord = asyncRecords.find(cur.second);
+					if (curAsyncRecord == asyncRecords.end()) continue;
+				
+					for (std::vector<CLRDATA_ADDRESS>::iterator contIt = curAsyncRecord->second.Continuations.begin(); contIt != curAsyncRecord->second.Continuations.end(); ++contIt)
 					{
-						for (std::vector<CLRDATA_ADDRESS>::iterator contIt = curStateMachine->second.Continuations->begin(); contIt != curStateMachine->second.Continuations->end(); ++contIt)
+						sos::Object cont = *contIt;
+						for (int i = 0; i < cur.first; i++) ExtOut(".");
+						DMLOut("%s", DMLObject(cont.GetAddress()));
+						
+						std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator contAsyncRecord = asyncRecords.find(cont.GetAddress());
+						if (contAsyncRecord != asyncRecords.end())
 						{
-							sos::Object cont = *contIt;
-							for (int i = 0; i < cur.first; i++) ExtOut(".");
-							DMLOut("%s", DMLObject(cont.GetAddress()));
-							ExtOut(" (%S)\n", cont.GetTypeName());
-							continuationChainToExplore.push_back(std::pair<int, CLRDATA_ADDRESS>(cur.first + 1, *contIt));
+							sos::MethodTable contMT = contAsyncRecord->second.StateMachineMT;
+							ExtOut(" %S\n", contMT.GetName());
 						}
+						else
+						{
+							ExtOut(" %S\n", cont.GetTypeName());
+						}
+
+						continuationChainToExplore.push_back(std::pair<int, CLRDATA_ADDRESS>(cur.first + 1, *contIt));
 					}
 				}
 			}
@@ -4553,18 +4578,13 @@ DECLARE_API(DumpAsync)
                 GCRootImpl gcroot;
                 int numRoots = gcroot.PrintRootsForObject(obj.GetAddress(), FALSE, FALSE);
                 DecrementIndent();
-                if (arIt->second.StateValue >= 0 && numRoots == 0)
+                if (numRoots == 0 && TaskIsCompleted(obj))
                 {
-                    ExtOut("Incomplete state machine (<>1__state == %d) with 0 roots.\n", arIt->second.StateValue);
+                    ExtOut("Incomplete state machine or task with 0 roots.\n");
                 }
             }
 
 			ExtOut("\n");
-		}
-
-		for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
-		{
-			delete arIt->second.Continuations;
 		}
 
         return S_OK;
@@ -10756,27 +10776,6 @@ DECLARE_API(GCHandles)
     }
 
     return Status;
-}
-
-BOOL derivedFrom(CLRDATA_ADDRESS mtObj, __in_z LPWSTR baseString)
-{
-    // We want to follow back until we get the mt for System.Exception
-    DacpMethodTableData dmtd;
-    CLRDATA_ADDRESS walkMT = mtObj;
-    while(walkMT != NULL)
-    {
-        if (dmtd.Request(g_sos, walkMT) != S_OK)
-        {
-            break;            
-        }
-        NameForMT_s (TO_TADDR(walkMT), g_mdName, mdNameLen);                
-        if (_wcscmp (baseString, g_mdName) == 0)
-        {
-            return TRUE;
-        }
-        walkMT = dmtd.ParentMethodTable;
-    }
-    return FALSE;
 }
 
 // This is an experimental and undocumented SOS API that attempts to step through code
