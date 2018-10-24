@@ -4225,6 +4225,79 @@ BOOL derivedFrom(CLRDATA_ADDRESS mtObj, __in_z LPWSTR baseString)
 	return FALSE;
 }
 
+BOOL TryGetMethodForDelegate(CLRDATA_ADDRESS delegateAddr, CLRDATA_ADDRESS* methodDescriptor)
+{
+	if (!sos::IsObject(delegateAddr, false))
+	{
+		return FALSE;
+	}
+
+	// If it was, or if it's storing an action, try to follow through to the action's target.
+	sos::Object delegateObj = delegateAddr;
+	int offset;
+
+	if ((offset = GetObjFieldOffset(delegateObj.GetAddress(), delegateObj.GetMT(), W("_methodPtrAux"))) != 0)
+	{
+		CLRDATA_ADDRESS methodPtrAux;
+		MOVE(methodPtrAux, delegateObj.GetAddress() + offset);
+
+		if (methodPtrAux != NULL)
+		{
+			DacpCodeHeaderData codeHeaderData;
+			if (codeHeaderData.Request(g_sos, methodPtrAux) == S_OK)
+			{
+				*methodDescriptor = codeHeaderData.MethodDescPtr;
+				return TRUE;
+			}
+		}
+	}
+
+	if ((offset = GetObjFieldOffset(delegateObj.GetAddress(), delegateObj.GetMT(), W("_methodPtr"))) != 0)
+	{
+		CLRDATA_ADDRESS methodPtr;
+		MOVE(methodPtr, delegateObj.GetAddress() + offset);
+
+		if (methodPtr != NULL)
+		{
+			if (g_sos->GetMethodDescPtrFromIP(methodPtr, methodDescriptor) == S_OK)
+			{
+				return TRUE;
+			}
+
+			DacpCodeHeaderData codeHeaderData;
+			if (codeHeaderData.Request(g_sos, methodPtr) == S_OK)
+			{
+				*methodDescriptor = codeHeaderData.MethodDescPtr;
+				return TRUE;
+			}
+		}
+	}
+
+	return FALSE;
+}
+
+void ExtOutTaskDelegateMethod(CLRDATA_ADDRESS taskAddr)
+{
+	if (sos::IsObject(taskAddr, false))
+	{
+		sos::Object obj = taskAddr;
+
+		DacpFieldDescData actionField;
+		int offset = GetObjFieldOffset(obj.GetAddress(), obj.GetMT(), W("m_action"), TRUE, &actionField);
+		if (offset != 0)
+		{
+			CLRDATA_ADDRESS actionAddr;
+			MOVE(actionAddr, obj.GetAddress() + offset);
+			CLRDATA_ADDRESS actionMD;
+			if (actionAddr != NULL && TryGetMethodForDelegate(actionAddr, &actionMD))
+			{
+				NameForMD_s(actionMD, g_mdName, mdNameLen);
+				ExtOut("%S ", g_mdName);
+			}
+		}
+	}
+}
+
 DECLARE_API(DumpAsync)
 {
     INIT_API();
@@ -4243,22 +4316,23 @@ DECLARE_API(DumpAsync)
 		ArrayHolder<char> ansiType = NULL;
 		ArrayHolder<char> dgmlPath = NULL;
         ArrayHolder<WCHAR> type = NULL;
-		BOOL dml = FALSE, waiting = FALSE, roots = FALSE, allTasks = FALSE;
+		BOOL dml = FALSE, completed = FALSE, roots = FALSE, allTasks = FALSE, showFields = FALSE;
         CMDOption option[] =
         {   // name, vptr, type, hasValue
-            { "-mt", &mt, COHEX, TRUE },             // dump state machines only with a given MethodTable
-			{ "-type", &ansiType, COSTRING, TRUE },  // dump state machines only that contain the specified type substring
-			{ "-tasks", &allTasks, COBOOL, FALSE },  // include all tasks that can be found on the heap
-			{ "-dgml", &dgmlPath, COSTRING, TRUE },  // output state machine graph to specified dgml file
-            { "-waiting", &waiting, COBOOL, FALSE }, // dump state machines only when they're in a waiting state
-			{ "-roots", &roots, COBOOL, FALSE },     // gather GC root information
+            { "-mt", &mt, COHEX, TRUE },                 // dump state machines only with a given MethodTable
+			{ "-type", &ansiType, COSTRING, TRUE },      // dump state machines only that contain the specified type substring
+			{ "-tasks", &allTasks, COBOOL, FALSE },      // include all tasks that can be found on the heap, not just async methods
+			{ "-fields", &showFields, COBOOL, FALSE },     // show fields of found async state machines
+			{ "-completed", &completed, COBOOL, FALSE }, // include async objects that are in a completed state
+			{ "-roots", &roots, COBOOL, FALSE },         // gather and output GC root information
+			{ "-dgml", &dgmlPath, COSTRING, TRUE },      // output state machine graph to specified dgml file
 #ifndef FEATURE_PAL
-            { "/d", &dml, COBOOL, FALSE },            // Debugger Markup Language
+            { "/d", &dml, COBOOL, FALSE },               // Debugger Markup Language
 #endif
         };
         if (!GetCMDOption(args, option, _countof(option), NULL, 0, &nArg))
         {
-            sos::Throw<sos::Exception>("Usage: DumpAsync [-mt MethodTableAddr] [-type TypeName] [-tasks] [-waiting] [-roots] [-dgml]");
+            sos::Throw<sos::Exception>("Usage: DumpAsync [-mt MethodTableAddr] [-type TypeName] [-tasks] [-completed] [-roots] [-fields] [-dgml]");
         }
         if (nArg != 0)
         {
@@ -4309,8 +4383,8 @@ DECLARE_API(DumpAsync)
 				continue;
 			}
 
-			// If we only want tasks if they're not completed, skip this one if it's a task and it's completed.
-			if (waiting && TaskIsCompleted(*itr))
+			// If we only want to include incomplete async objects, skip this one if it's a task and it's completed.
+			if (!completed && TaskIsCompleted(*itr))
 			{
 				continue;
 			}
@@ -4418,17 +4492,17 @@ DECLARE_API(DumpAsync)
 
 		if (dgmlPath != NULL)
 		{
-			std::map<CLRDATA_ADDRESS, int> mtCounts;
+			std::map<CLRDATA_ADDRESS, std::pair<CLRDATA_ADDRESS,int>> mtCounts;
 			for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 			{
-				std::map<CLRDATA_ADDRESS, int>::iterator found = mtCounts.find(arIt->second.MT);
+				std::map<CLRDATA_ADDRESS, std::pair<CLRDATA_ADDRESS, int>>::iterator found = mtCounts.find(arIt->second.MT);
 				if (found == mtCounts.end())
 				{
-					mtCounts.insert(std::pair<CLRDATA_ADDRESS, int>(arIt->second.MT, 1));
+					mtCounts.insert(std::pair<CLRDATA_ADDRESS, std::pair<CLRDATA_ADDRESS, int>>(arIt->second.MT, std::pair<CLRDATA_ADDRESS, int>(arIt->second.StateMachineMT, 1)));
 				}
 				else
 				{
-					found->second++;
+					found->second.second++;
 				}
 
 				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations.begin(); contIt != arIt->second.Continuations.end(); ++contIt)
@@ -4436,14 +4510,14 @@ DECLARE_API(DumpAsync)
 					if (asyncRecords.find(*contIt) == asyncRecords.end())
 					{
 						sos::Object contObj = *contIt;
-						std::map<CLRDATA_ADDRESS, int>::iterator found = mtCounts.find(contObj.GetMT());
+						std::map<CLRDATA_ADDRESS, std::pair<CLRDATA_ADDRESS, int>>::iterator found = mtCounts.find(contObj.GetMT());
 						if (found == mtCounts.end())
 						{
-							mtCounts.insert(std::pair<CLRDATA_ADDRESS, int>(contObj.GetMT(), 1));
+							mtCounts.insert(std::pair<CLRDATA_ADDRESS, std::pair<CLRDATA_ADDRESS, int>>(contObj.GetMT(), std::pair<CLRDATA_ADDRESS, int>(contObj.GetMT(), 1)));
 						}
 						else
 						{
-							found->second++;
+							found->second.second++;
 						}
 					}
 				}
@@ -4455,10 +4529,10 @@ DECLARE_API(DumpAsync)
 			fs << L"<DirectedGraph Title=\"Async Graph\" xmlns=\"http://schemas.microsoft.com/vs/2009/dgml\">";
 			fs << L"  <Nodes>";
 
-			for (std::map<CLRDATA_ADDRESS, int>::iterator mtIt = mtCounts.begin(); mtIt != mtCounts.end(); ++mtIt)
+			for (std::map<CLRDATA_ADDRESS, std::pair<CLRDATA_ADDRESS, int>>::iterator mtIt = mtCounts.begin(); mtIt != mtCounts.end(); ++mtIt)
 			{
-				sos::MethodTable curMT = mtIt->first;
 				fs << L"    <Node Id=\"" << mtIt->first << L"\" Label=\"";
+				sos::MethodTable curMT = mtIt->second.first;
 				for (const WCHAR* c = curMT.GetName(); *c != 0; c++)
 				{
 					switch (*c)
@@ -4471,7 +4545,7 @@ DECLARE_API(DumpAsync)
 						default:   fs << *c; break;
 					}
 				}
-				fs << L" (" << mtIt->second << L")\" />";
+				fs << L" (" << mtIt->second.second << L")\" />";
 			}
 
 			fs << L"  </Nodes>";
@@ -4514,7 +4588,7 @@ DECLARE_API(DumpAsync)
 			sos::Object obj = arIt->second.Address;
 
 			// Output the state machine's name and fields, address, MT, size, and name.
-			ExtOut("#%d", counter++);
+			ExtOut("#%d ", counter++);
 			DacpMethodTableData mtabledata;
 			DacpMethodTableFieldData vMethodTableFields;
 			if (arIt->second.IsStateMachine &&
@@ -4523,13 +4597,17 @@ DECLARE_API(DumpAsync)
 				vMethodTableFields.wNumInstanceFields + vMethodTableFields.wNumStaticFields > 0)
 			{
 				sos::MethodTable mt = (TADDR)arIt->second.StateMachineMT;
-				ExtOut(" StateMachine: %S (%s)\n", mt.GetName(), arIt->second.IsValueType ? "struct" : "class");
+				ExtOut("%S (%s)\n", mt.GetName(), arIt->second.IsValueType ? "struct" : "class");
 				DMLOut("%s %s %8d", DMLObject(obj.GetAddress()), DMLDumpHeapMT(obj.GetMT()), obj.GetSize());
 				ExtOut("  %S\n", obj.GetTypeName());
-				DisplayFields(arIt->second.StateMachineMT, &mtabledata, &vMethodTableFields, (DWORD_PTR)arIt->second.StateMachineAddr, TRUE, arIt->second.IsValueType);
+				if (showFields)
+				{
+					DisplayFields(arIt->second.StateMachineMT, &mtabledata, &vMethodTableFields, (DWORD_PTR)arIt->second.StateMachineAddr, TRUE, arIt->second.IsValueType);
+				}
 			}
 			else
 			{
+				ExtOutTaskDelegateMethod(obj.GetAddress());
 				ExtOut("\n");
 				DMLOut("%s %s %8d", DMLObject(obj.GetAddress()), DMLDumpHeapMT(obj.GetMT()), obj.GetSize());
 				ExtOut("  %S\n", obj.GetTypeName());
@@ -4537,7 +4615,7 @@ DECLARE_API(DumpAsync)
 
 			if (arIt->second.Continuations.size() > 0)
 			{
-				ExtOut("Continuations:\n");
+				ExtOut(allTasks ? "Continuation chains:\n" : "Async \"stack\":\n");
 				std::vector<std::pair<int, CLRDATA_ADDRESS>> continuationChainToExplore;
 				continuationChainToExplore.push_back(std::pair<int, CLRDATA_ADDRESS>(1, obj.GetAddress()));
 				while (continuationChainToExplore.size() > 0)
@@ -4551,17 +4629,19 @@ DECLARE_API(DumpAsync)
 					{
 						sos::Object cont = *contIt;
 						for (int i = 0; i < cur.first; i++) ExtOut(".");
-						DMLOut("%s", DMLObject(cont.GetAddress()));
+						DMLOut("%s ", DMLObject(cont.GetAddress()));
+
+						ExtOutTaskDelegateMethod(cont.GetAddress());
 						
 						std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator contAsyncRecord = asyncRecords.find(cont.GetAddress());
 						if (contAsyncRecord != asyncRecords.end())
 						{
 							sos::MethodTable contMT = contAsyncRecord->second.StateMachineMT;
-							ExtOut(" %S\n", contMT.GetName());
+							ExtOut("%S\n", contMT.GetName());
 						}
 						else
 						{
-							ExtOut(" %S\n", cont.GetTypeName());
+							ExtOut("%S\n", cont.GetTypeName());
 						}
 
 						continuationChainToExplore.push_back(std::pair<int, CLRDATA_ADDRESS>(cur.first + 1, *contIt));
