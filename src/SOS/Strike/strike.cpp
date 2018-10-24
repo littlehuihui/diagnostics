@@ -4110,7 +4110,53 @@ private:
 *                                                                      *
 \**********************************************************************/
 
-bool TryGetContinuation(CLRDATA_ADDRESS addr, CLRDATA_ADDRESS mt, CLRDATA_ADDRESS* contAddr, CLRDATA_ADDRESS* contMT)
+void ResolveContinuation(CLRDATA_ADDRESS* contAddr)
+{
+	// Ideally this continuation is itself an async method box.
+	sos::Object contObj = *contAddr;
+	if (GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("StateMachine")) == 0)
+	{
+		// It was something else.
+
+		// If it's a standard task continuation, get its task field.
+		int offset;
+		if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("m_task"))) != 0)
+		{
+			MOVE(*contAddr, contObj.GetAddress() + offset);
+			if (sos::IsObject(*contAddr, false))
+			{
+				contObj = *contAddr;
+			}
+		}
+		else
+		{
+			// If it's storing an action wrapper, try to follow to that action's target.
+			if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("m_action"))) != 0)
+			{
+				MOVE(*contAddr, contObj.GetAddress() + offset);
+				if (sos::IsObject(*contAddr, false))
+				{
+					contObj = *contAddr;
+				}
+			}
+
+			// If it was, or if it's storing an action, try to follow through to the action's target.
+			if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("_target"))) != 0)
+			{
+				MOVE(*contAddr, contObj.GetAddress() + offset);
+				if (sos::IsObject(*contAddr, false))
+				{
+					contObj = *contAddr;
+				}
+			}
+		}
+
+		// Use whatever object we ended with.
+		*contAddr = contObj.GetAddress();
+	}
+}
+
+bool TryGetContinuation(CLRDATA_ADDRESS addr, CLRDATA_ADDRESS mt, CLRDATA_ADDRESS* contAddr)
 {
 	// Get the continuation field from the task.
 	int offset = GetObjFieldOffset(addr, mt, W("m_continuationObject"));
@@ -4120,36 +4166,8 @@ bool TryGetContinuation(CLRDATA_ADDRESS addr, CLRDATA_ADDRESS mt, CLRDATA_ADDRES
 		MOVE(contObjPtr, addr + offset);
 		if (sos::IsObject(contObjPtr, false))
 		{
-			// Ideally this continuation is itself an async method box.
-			sos::Object contObj = contObjPtr;
-			if (GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("StateMachine")) == 0)
-			{
-				// It was something else.
-				
-				// If it's storing an action wrapper, try to follow to that action's target.
-				if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("m_action"))) != 0)
-				{
-					MOVE(contObjPtr, contObj.GetAddress() + offset);
-					if (sos::IsObject(contObjPtr, false))
-					{
-						contObj = contObjPtr;
-					}
-				}
-
-				// If it's storing an action, try to follow through to its target.
-				if ((offset = GetObjFieldOffset(contObj.GetAddress(), contObj.GetMT(), W("_target"))) != 0)
-				{
-					MOVE(contObjPtr, contObj.GetAddress() + offset);
-					if (sos::IsObject(contObjPtr, false))
-					{
-						contObj = contObjPtr;
-					}
-				}
-			}
-
-			// Use whatever object we ended with.
-			*contAddr = contObj.GetAddress();
-			*contMT = contObj.GetMT();
+			*contAddr = TO_CDADDR(contObjPtr);
+			ResolveContinuation(contAddr);
 			return true;
 		}
 	}
@@ -4157,7 +4175,7 @@ bool TryGetContinuation(CLRDATA_ADDRESS addr, CLRDATA_ADDRESS mt, CLRDATA_ADDRES
 	return false;
 }
 
-struct StateMachineRecord
+struct AsyncRecord
 {
 	CLRDATA_ADDRESS Address;
 	CLRDATA_ADDRESS MT;
@@ -4194,7 +4212,7 @@ DECLARE_API(DumpAsync)
 			{ "-type", &ansiType, COSTRING, TRUE },  // dump state machines only that contain the specified type substring
 			{ "-dgml", &dgmlPath, COSTRING, TRUE },  // output state machine graph to specified dgml file
             { "-waiting", &waiting, COBOOL, FALSE }, // dump state machines only when they're in a waiting state
-            { "-roots", &roots, COBOOL, FALSE },     // gather GC root information
+			{ "-roots", &roots, COBOOL, FALSE },     // gather GC root information
 #ifndef FEATURE_PAL
             { "/d", &dml, COBOOL, FALSE },            // Debugger Markup Language
 #endif
@@ -4228,7 +4246,7 @@ DECLARE_API(DumpAsync)
         }
 
         // Walk each heap object looking for async state machine objects.
-		std::map<CLRDATA_ADDRESS, StateMachineRecord*> stateMachineRecords;
+		std::map<CLRDATA_ADDRESS, AsyncRecord> asyncRecords;
 		BOOL missingStateFieldWarning = FALSE;
 		for (sos::ObjectIterator itr = gcheap.WalkHeap(); !IsInterrupt() && itr != NULL; ++itr)
 		{
@@ -4308,20 +4326,20 @@ DECLARE_API(DumpAsync)
 			}
 
 			// We now have a state machine that's passed all of our criteria.
-			StateMachineRecord* smr = new StateMachineRecord();
-			smr->Address = itr->GetAddress();
-			smr->MT = itr->GetMT();
-			smr->StateMachineAddr = stateMachineAddr;
-			smr->StateMachineMT = stateMachineMT;
-			smr->IsValueType = bStateMachineIsValueType;
-			smr->Continuations = new std::vector<CLRDATA_ADDRESS>();
-			smr->IsTopLevel = true;
-			smr->StateValue = stateValue;
-			stateMachineRecords.insert(std::pair<CLRDATA_ADDRESS, StateMachineRecord*>(smr->Address, smr));
+			AsyncRecord ar;
+			ar.Address = itr->GetAddress();
+			ar.MT = itr->GetMT();
+			ar.StateMachineAddr = stateMachineAddr;
+			ar.StateMachineMT = stateMachineMT;
+			ar.IsValueType = bStateMachineIsValueType;
+			ar.Continuations = new std::vector<CLRDATA_ADDRESS>();
+			ar.IsTopLevel = true;
+			ar.StateValue = stateValue;
 
-			CLRDATA_ADDRESS nextAddr, nextMT;
-			if (TryGetContinuation(itr->GetAddress(), itr->GetMT(), &nextAddr, &nextMT))
+			CLRDATA_ADDRESS nextAddr;
+			if (TryGetContinuation(itr->GetAddress(), itr->GetMT(), &nextAddr))
 			{
+				bool addedList = false;
 				sos::Object contObj = nextAddr;
 				if (_wcsncmp(contObj.GetTypeName(), W("System.Collections.Generic.List`1"), 33) == 0)
 				{
@@ -4336,36 +4354,42 @@ DECLARE_API(DumpAsync)
 							DacpObjectData objData;
 							if (objData.Request(g_sos, TO_CDADDR(listItemsPtr)) == S_OK && objData.ObjectType == OBJ_ARRAY)
 							{
+								addedList = true;
 								for (int i = 0; i < objData.dwNumComponents; i++)
 								{
 									CLRDATA_ADDRESS elementPtr;
 									MOVE(elementPtr, TO_CDADDR(objData.ArrayDataPtr + (i * objData.dwComponentSize)));
 									if (elementPtr != NULL && sos::IsObject(elementPtr, false))
 									{
-										smr->Continuations->push_back(elementPtr);
+										ResolveContinuation(&elementPtr);
+										ar.Continuations->push_back(elementPtr);
 									}
 								}
-								continue;
 							}
 						}
 					}
 				}
 
-				smr->Continuations->push_back(contObj.GetAddress());
+				if (!addedList)
+				{
+					ar.Continuations->push_back(contObj.GetAddress());
+				}
 			}
+
+			asyncRecords.insert(std::pair<CLRDATA_ADDRESS, AsyncRecord>(ar.Address, ar));
 		}
 
-		size_t uniqueChains = stateMachineRecords.size();
-		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+		size_t uniqueChains = asyncRecords.size();
+		for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 		{
-			for (std::vector<CLRDATA_ADDRESS>::iterator contIt = smrIt->second->Continuations->begin(); contIt != smrIt->second->Continuations->end(); ++contIt)
+			for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations->begin(); contIt != arIt->second.Continuations->end(); ++contIt)
 			{
-				std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator found = stateMachineRecords.find(*contIt);
-				if (found != stateMachineRecords.end())
+				std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator found = asyncRecords.find(*contIt);
+				if (found != asyncRecords.end())
 				{
-					if (found->second->IsTopLevel)
+					if (found->second.IsTopLevel)
 					{
-						found->second->IsTopLevel = false;
+						found->second.IsTopLevel = false;
 						uniqueChains--;
 					}
 				}
@@ -4375,17 +4399,33 @@ DECLARE_API(DumpAsync)
 		if (dgmlPath != NULL)
 		{
 			std::map<CLRDATA_ADDRESS, int> mtCounts;
-			for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+			for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 			{
-				CLRDATA_ADDRESS addr = smrIt->second->StateMachineMT != 0 ? smrIt->second->StateMachineMT : smrIt->second->MT;
-				std::map<CLRDATA_ADDRESS, int>::iterator found = mtCounts.find(addr);
+				std::map<CLRDATA_ADDRESS, int>::iterator found = mtCounts.find(arIt->second.MT);
 				if (found == mtCounts.end())
 				{
-					mtCounts.insert(std::pair<CLRDATA_ADDRESS, int>(addr, 1));
+					mtCounts.insert(std::pair<CLRDATA_ADDRESS, int>(arIt->second.MT, 1));
 				}
 				else
 				{
 					found->second++;
+				}
+
+				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations->begin(); contIt != arIt->second.Continuations->end(); ++contIt)
+				{
+					if (asyncRecords.find(*contIt) == asyncRecords.end())
+					{
+						sos::Object contObj = *contIt;
+						std::map<CLRDATA_ADDRESS, int>::iterator found = mtCounts.find(contObj.GetMT());
+						if (found == mtCounts.end())
+						{
+							mtCounts.insert(std::pair<CLRDATA_ADDRESS, int>(contObj.GetMT(), 1));
+						}
+						else
+						{
+							found->second++;
+						}
+					}
 				}
 			}
 
@@ -4417,19 +4457,19 @@ DECLARE_API(DumpAsync)
 			fs << L"  </Nodes>";
 			fs << L"  <Links>";
 
-			for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+			for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 			{
-				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = smrIt->second->Continuations->begin(); contIt != smrIt->second->Continuations->end(); ++contIt)
+				for (std::vector<CLRDATA_ADDRESS>::iterator contIt = arIt->second.Continuations->begin(); contIt != arIt->second.Continuations->end(); ++contIt)
 				{
 					sos::Object contObj = *contIt;
-					fs << L"    <Link Source=\"" << smrIt->second->MT << L"\" Target=\"" << contObj.GetMT() << L"\" Label=\"\" />";
+					fs << L"    <Link Source=\"" << arIt->second.MT << L"\" Target=\"" << contObj.GetMT() << L"\" Label=\"\" />";
 
-					std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator found = stateMachineRecords.find(*contIt);
-					if (found != stateMachineRecords.end())
+					std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator found = asyncRecords.find(*contIt);
+					if (found != asyncRecords.end())
 					{
-						if (found->second->IsTopLevel)
+						if (found->second.IsTopLevel)
 						{
-							found->second->IsTopLevel = false;
+							found->second.IsTopLevel = false;
 							uniqueChains--;
 						}
 					}
@@ -4442,7 +4482,7 @@ DECLARE_API(DumpAsync)
 			fs.close();
 		}
 
-		ExtOut("\nFound %d state machines in %d chains.\n", stateMachineRecords.size(), uniqueChains);
+		ExtOut("\nFound %d state machines in %d chains.\n", asyncRecords.size(), uniqueChains);
 		if (missingStateFieldWarning)
 		{
 			ExtOut("Warning: Could not find a state machine's <>1__state field.\n");
@@ -4453,25 +4493,25 @@ DECLARE_API(DumpAsync)
 		ExtOut("%" POINTERSIZE "s %" POINTERSIZE "s %8s %s\n", "Address", "MT", "Size", "Name");
 
 		int counter = 0;
-		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+		for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 		{
-			if (!smrIt->second->IsTopLevel) continue;
+			if (!arIt->second.IsTopLevel) continue;
 			
-			sos::Object obj = smrIt->second->Address;
+			sos::Object obj = arIt->second.Address;
 
 			// Output the state machine's name and fields, address, MT, size, and name.
 			ExtOut("#%d", counter++);
 			DacpMethodTableData mtabledata;
 			DacpMethodTableFieldData vMethodTableFields;
-			if (mtabledata.Request(g_sos, smrIt->second->StateMachineMT) == S_OK &&
-				vMethodTableFields.Request(g_sos, smrIt->second->StateMachineMT) == S_OK &&
+			if (mtabledata.Request(g_sos, arIt->second.StateMachineMT) == S_OK &&
+				vMethodTableFields.Request(g_sos, arIt->second.StateMachineMT) == S_OK &&
 				vMethodTableFields.wNumInstanceFields + vMethodTableFields.wNumStaticFields > 0)
 			{
-				sos::MethodTable mt = (TADDR)smrIt->second->StateMachineMT;
-				ExtOut(" StateMachine: %S (%s)\n", mt.GetName(), smrIt->second->IsValueType ? "struct" : "class");
+				sos::MethodTable mt = (TADDR)arIt->second.StateMachineMT;
+				ExtOut(" StateMachine: %S (%s)\n", mt.GetName(), arIt->second.IsValueType ? "struct" : "class");
 				DMLOut("%s %s %8d", DMLObject(obj.GetAddress()), DMLDumpHeapMT(obj.GetMT()), obj.GetSize());
 				ExtOut("  %S\n", obj.GetTypeName());
-				DisplayFields(smrIt->second->StateMachineMT, &mtabledata, &vMethodTableFields, (DWORD_PTR)smrIt->second->StateMachineAddr, TRUE, smrIt->second->IsValueType);
+				DisplayFields(arIt->second.StateMachineMT, &mtabledata, &vMethodTableFields, (DWORD_PTR)arIt->second.StateMachineAddr, TRUE, arIt->second.IsValueType);
 			}
 			else
 			{
@@ -4480,7 +4520,7 @@ DECLARE_API(DumpAsync)
 				ExtOut("  %S\n", obj.GetTypeName());
 			}
 
-			if (smrIt->second->Continuations->size() > 0)
+			if (arIt->second.Continuations->size() > 0)
 			{
 				ExtOut("Continuations:\n");
 				std::vector<std::pair<int, CLRDATA_ADDRESS>> continuationChainToExplore;
@@ -4489,10 +4529,10 @@ DECLARE_API(DumpAsync)
 				{
 					std::pair<int, CLRDATA_ADDRESS> cur = continuationChainToExplore.back();
 					continuationChainToExplore.pop_back();
-					std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator curStateMachine = stateMachineRecords.find(cur.second);
-					if (curStateMachine != stateMachineRecords.end())
+					std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator curStateMachine = asyncRecords.find(cur.second);
+					if (curStateMachine != asyncRecords.end())
 					{
-						for (std::vector<CLRDATA_ADDRESS>::iterator contIt = curStateMachine->second->Continuations->begin(); contIt != curStateMachine->second->Continuations->end(); ++contIt)
+						for (std::vector<CLRDATA_ADDRESS>::iterator contIt = curStateMachine->second.Continuations->begin(); contIt != curStateMachine->second.Continuations->end(); ++contIt)
 						{
 							sos::Object cont = *contIt;
 							for (int i = 0; i < cur.first; i++) ExtOut(".");
@@ -4513,19 +4553,18 @@ DECLARE_API(DumpAsync)
                 GCRootImpl gcroot;
                 int numRoots = gcroot.PrintRootsForObject(obj.GetAddress(), FALSE, FALSE);
                 DecrementIndent();
-                if (smrIt->second->StateValue >= 0 && numRoots == 0)
+                if (arIt->second.StateValue >= 0 && numRoots == 0)
                 {
-                    ExtOut("Incomplete state machine (<>1__state == %d) with 0 roots.\n", smrIt->second->StateValue);
+                    ExtOut("Incomplete state machine (<>1__state == %d) with 0 roots.\n", arIt->second.StateValue);
                 }
             }
 
 			ExtOut("\n");
 		}
 
-		for (std::map<CLRDATA_ADDRESS, StateMachineRecord*>::iterator smrIt = stateMachineRecords.begin(); smrIt != stateMachineRecords.end(); ++smrIt)
+		for (std::map<CLRDATA_ADDRESS, AsyncRecord>::iterator arIt = asyncRecords.begin(); arIt != asyncRecords.end(); ++arIt)
 		{
-			delete smrIt->second->Continuations;
-			delete smrIt->second;
+			delete arIt->second.Continuations;
 		}
 
         return S_OK;
